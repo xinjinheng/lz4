@@ -87,6 +87,8 @@
 **/
 
 #include <string.h>   /* memset, memcpy, memmove */
+#include <math.h>     /* log2 */
+#include <stddef.h>   /* offsetof */
 #ifndef LZ4_SRC_INCLUDED  /* avoid redefinition when sources are coalesced */
 #  define MEM_INIT(p,v,s)   memset((p),(v),(s))
 #endif
@@ -97,6 +99,161 @@
 #  define ALLOC_AND_ZERO(s) calloc(1,(s))
 #  define FREEMEM(p)        free(p)
 #endif
+
+/* Statistical analysis functions for adaptive compression */
+static double LZ4F_calculateEntropy(const BYTE* data, size_t size) {
+    unsigned int histogram[256] = {0};
+    size_t i;
+    double entropy = 0.0;
+    
+    for (i = 0; i < size; ++i) {
+        histogram[data[i]]++;
+    }
+    
+    for (i = 0; i < 256; ++i) {
+        if (histogram[i] == 0) continue;
+        double p = (double)histogram[i] / size;
+        entropy -= p * log2(p);
+    }
+    
+    return entropy;
+}
+
+/* Rolling hash for delta compression */
+static uint32_t LZ4F_calculateRollingHash(const BYTE* data, size_t size) {
+    uint32_t hash = 0;
+    size_t i;
+    
+    for (i = 0; i < size; ++i) {
+        hash = (hash << 5) - hash + data[i]; /* DJB2 hash */
+    }
+    
+    return hash;
+}
+
+/* Delta compression */
+static size_t LZ4F_deltaCompress(const BYTE* src, size_t srcSize, BYTE* dst, size_t dstCapacity, const BYTE* prevData, size_t prevDataSize) {
+    /* If no previous data, just copy the data */
+    if (prevData == NULL || prevDataSize == 0) {
+        if (dstCapacity < srcSize) return 0;
+        memcpy(dst, src, srcSize);
+        return srcSize;
+    }
+    
+    /* Check if dst buffer is large enough */
+    if (dstCapacity < srcSize) return 0;
+    
+    /* Perform delta compression */
+    size_t i;
+    for (i = 0; i < srcSize && i < prevDataSize; ++i) {
+        dst[i] = src[i] - prevData[i];
+    }
+    
+    /* Copy remaining bytes */
+    for (; i < srcSize; ++i) {
+        dst[i] = src[i];
+    }
+    
+    return srcSize;
+}
+
+static double LZ4F_calculateRepeatDensity(const BYTE* data, size_t size) {
+    if (size < 2) return 0.0;
+    
+    unsigned int repeats = 0;
+    size_t i;
+    
+    for (i = 1; i < size; ++i) {
+        if (data[i] == data[i-1]) {
+            repeats++;
+        }
+    }
+    
+    return (double)repeats / (size - 1);
+}
+
+static double LZ4F_calculateMatchDensity(const BYTE* data, size_t size) {
+    /* Calculate density of 4-byte matches */
+    if (size < 4) return 0.0;
+    
+    unsigned int matches = 0;
+    size_t i;
+    
+    for (i = 0; i < size - 3; ++i) {
+        const BYTE* p = data + i;
+        if (p[0] == p[1] && p[0] == p[2] && p[0] == p[3]) {
+            matches++;
+        }
+    }
+    
+    return (double)matches / (size - 3);
+}
+
+/* Predict optimal compression level based on statistical features and history */
+static int LZ4F_predictOptimalLevel(LZ4F_cctx_t* cctxPtr, double entropy, double repeatDensity, double matchDensity, size_t blockSize) {
+    /* Advanced heuristic-based prediction model */
+    /* Adjust these thresholds based on empirical data */
+    int level;
+    
+    /* Very low entropy (highly compressible) */
+    if (entropy < 2.5) {
+        /* Use high compression levels */
+        level = 10;
+    } 
+    /* Low entropy */
+    else if (entropy < 4.0) {
+        /* Use moderate to high compression levels */
+        level = 7;
+    } 
+    /* Medium entropy */
+    else if (entropy < 5.5) {
+        /* Balance between speed and compression */
+        level = 5;
+    } 
+    /* High entropy (less compressible) */
+    else if (entropy < 6.5) {
+        /* Use faster compression levels */
+        level = 3;
+    } 
+    /* Very high entropy (hardly compressible) */
+    else {
+        level = 1;
+    }
+    
+    /* Adjust based on repeat density */
+    if (repeatDensity > 0.8) {
+        /* Highly repetitive data benefits from higher compression */
+        level = LZ4_MIN(level + 2, LZ4HC_CLEVEL_MAX);
+    } else if (repeatDensity < 0.1) {
+        /* Low repetition benefits from faster compression */
+        level = LZ4_MAX(level - 1, 1);
+    }
+    
+    /* Adjust based on match density */
+    if (matchDensity > 0.2) {
+        /* High match density benefits from higher compression */
+        level = LZ4_MIN(level + 1, LZ4HC_CLEVEL_MAX);
+    }
+    
+    return level;
+}
+
+/* Update compression history with new block information */
+static void LZ4F_updateHistory(LZ4F_cctx_t* cctxPtr, int level, double entropy, double repeatDensity, double matchDensity, double compressionRatio, unsigned long long compressionTime) {
+    /* Store in circular buffer */
+    LZ4F_compressionHistory_t* entry = &cctxPtr->history[cctxPtr->historyIndex];
+    entry->level = level;
+    entry->entropy = entropy;
+    entry->repeatDensity = repeatDensity;
+    entry->compressionRatio = compressionRatio;
+    entry->compressionTime = compressionTime;
+    
+    /* Update history index and count */
+    cctxPtr->historyIndex = (cctxPtr->historyIndex + 1) % LZ4F_MAX_HISTORY;
+    if (cctxPtr->historyCount < LZ4F_MAX_HISTORY) {
+        cctxPtr->historyCount++;
+    }
+}
 
 static void* LZ4F_calloc(size_t s, LZ4F_CustomMem cmem)
 {
@@ -248,6 +405,7 @@ static void LZ4F_writeLE64 (void* dst, U64 value64)
 
 #define LZ4F_BLOCKUNCOMPRESSED_FLAG 0x80000000U
 #define LZ4F_BLOCKSIZEID_DEFAULT LZ4F_max64KB
+#define LZ4F_BLOCKSIZE_MAX (4 * 1024 * 1024)  /* 4MB */
 
 static const size_t minFHSize = LZ4F_HEADER_SIZE_MIN;   /*  7 */
 static const size_t maxFHSize = LZ4F_HEADER_SIZE_MAX;   /* 19 */
@@ -261,6 +419,18 @@ static const size_t BFSize = LZ4F_BLOCK_CHECKSUM_SIZE;  /* block footer : checks
 
 typedef enum { LZ4B_COMPRESSED, LZ4B_UNCOMPRESSED} LZ4F_BlockCompressMode_e;
 typedef enum { ctxNone, ctxFast, ctxHC } LZ4F_CtxType_e;
+
+/* Struct to track compression history for adaptive level selection */
+typedef struct LZ4F_compressionHistory_s {
+    int level;
+    double entropy;
+    double repeatDensity;
+    double matchDensity;
+    double compressionRatio;
+    unsigned long long compressionTime;
+} LZ4F_compressionHistory_t;
+
+#define LZ4F_MAX_HISTORY 8
 
 typedef struct LZ4F_cctx_s
 {
@@ -280,6 +450,16 @@ typedef struct LZ4F_cctx_s
     U16    lz4CtxAlloc; /* sized for: 0 = none, 1 = lz4 ctx, 2 = lz4hc ctx */
     U16    lz4CtxType;  /* in use as: 0 = none, 1 = lz4 ctx, 2 = lz4hc ctx */
     LZ4F_BlockCompressMode_e  blockCompressMode;
+    /* Adaptive compression fields */
+    LZ4F_compressionHistory_t history[LZ4F_MAX_HISTORY];
+    int historyIndex;
+    int historyCount;
+    /* Delta compression fields */
+    void* prevData;
+    size_t prevDataSize;
+    /* Stream compression fields */
+    uint32_t frameId;
+    uint32_t blockId;
 } LZ4F_cctx_t;
 
 
@@ -804,7 +984,8 @@ size_t LZ4F_compressBegin_internal(LZ4F_cctx* cctx,
             + ((cctx->prefs.frameInfo.blockChecksumFlag & _1BIT ) << 4)
             + ((unsigned)(cctx->prefs.frameInfo.contentSize > 0) << 3)
             + ((cctx->prefs.frameInfo.contentChecksumFlag & _1BIT ) << 2)
-            +  (cctx->prefs.frameInfo.dictID > 0) );
+            + ((cctx->prefs.frameInfo.dictID > 0) << 1)
+            +  (cctx->prefs.adaptiveMode & _1BIT) );
         /* BD Byte */
         *dstPtr++ = (BYTE)((cctx->prefs.frameInfo.blockSizeID & _3BITS) << 4);
         /* Optional Frame content size field */
@@ -899,8 +1080,8 @@ static size_t LZ4F_makeBlock(void* dst,
                        const void* src, size_t srcSize,
                              compressFunc_t compress, void* lz4ctx, int level,
                        const LZ4F_CDict* cdict,
-                             LZ4F_blockChecksum_t crcFlag)
-{
+                             LZ4F_blockChecksum_t crcFlag,
+                             uint32_t frameId, uint32_t blockId) {
     BYTE* const cSizePtr = (BYTE*)dst;
     int dstCapacity = (srcSize > 1) ? (int)srcSize - 1 : 1;
     U32 cSize;
@@ -915,6 +1096,13 @@ static size_t LZ4F_makeBlock(void* dst,
         memcpy(cSizePtr+BHSize, src, srcSize);
     } else {
         LZ4F_writeLE32(cSizePtr, cSize);
+    }
+    /* Add frame and block ID for stream compression */
+    if (frameId != 0 || blockId != 0) {
+        BYTE* idPtr = cSizePtr + BHSize + cSize;
+        LZ4F_writeLE32(idPtr, frameId);
+        LZ4F_writeLE32(idPtr + 4, blockId);
+        cSize += 8;
     }
     if (crcFlag) {
         U32 const crc32 = XXH32(cSizePtr+BHSize, cSize, 0);  /* checksum of compressed data */
@@ -1055,7 +1243,9 @@ static size_t LZ4F_compressUpdateImpl(LZ4F_cctx* cctxPtr,
                                      cctxPtr->tmpIn, blockSize,
                                      compress, cctxPtr->lz4CtxPtr, cctxPtr->prefs.compressionLevel,
                                      cctxPtr->cdict,
-                                     cctxPtr->prefs.frameInfo.blockChecksumFlag);
+                                     cctxPtr->prefs.frameInfo.blockChecksumFlag,
+                                     cctxPtr->prefs.streamMode ? cctxPtr->frameId : 0,
+                                     cctxPtr->prefs.streamMode ? cctxPtr->blockId : 0);
             if (cctxPtr->prefs.frameInfo.blockMode==LZ4F_blockLinked) cctxPtr->tmpIn += blockSize;
             cctxPtr->tmpInSize = 0;
     }   }
@@ -1063,11 +1253,97 @@ static size_t LZ4F_compressUpdateImpl(LZ4F_cctx* cctxPtr,
     while ((size_t)(srcEnd - srcPtr) >= blockSize) {
         /* compress full blocks */
         lastBlockCompressed = fromSrcBuffer;
-        dstPtr += LZ4F_makeBlock(dstPtr,
-                                 srcPtr, blockSize,
-                                 compress, cctxPtr->lz4CtxPtr, cctxPtr->prefs.compressionLevel,
-                                 cctxPtr->cdict,
-                                 cctxPtr->prefs.frameInfo.blockChecksumFlag);
+        
+        int currentLevel = cctxPtr->prefs.compressionLevel;
+        double entropy = 0.0;
+        double repeatDensity = 0.0;
+        double matchDensity = 0.0;
+        unsigned long long startTime = 0;
+        unsigned long long endTime = 0;
+        
+        BYTE* blockData = (BYTE*)srcPtr;
+        size_t blockDataSize = blockSize;
+        BYTE deltaBuffer[LZ4F_BLOCKSIZE_MAX];
+        BYTE* finalBlockData = blockData;
+        size_t finalBlockSize = blockSize;
+        
+        /* Delta compression */
+        if (cctxPtr->prefs.deltaMode) {
+            /* Calculate rolling hash for block */
+            uint32_t blockHash = LZ4F_calculateRollingHash(blockData, blockSize);
+            
+            /* Check if block is similar to previous block */
+            if (cctxPtr->prevData != NULL && cctxPtr->prevDataSize >= blockSize) {
+                /* Perform delta compression */
+                size_t deltaSize = LZ4F_deltaCompress(blockData, blockSize, deltaBuffer, LZ4F_BLOCKSIZE_MAX, cctxPtr->prevData, cctxPtr->prevDataSize);
+                if (deltaSize > 0) {
+                    finalBlockData = deltaBuffer;
+                    finalBlockSize = deltaSize;
+                }
+            }
+        }
+        
+        /* Adaptive compression level selection */
+        if (cctxPtr->prefs.adaptiveMode) {
+            /* Analyze data block features */
+            entropy = LZ4F_calculateEntropy(finalBlockData, finalBlockSize);
+            repeatDensity = LZ4F_calculateRepeatDensity(finalBlockData, finalBlockSize);
+            matchDensity = LZ4F_calculateMatchDensity(finalBlockData, finalBlockSize);
+            
+            /* Predict optimal compression level */
+            currentLevel = LZ4F_predictOptimalLevel(cctxPtr, entropy, repeatDensity, matchDensity, finalBlockSize);
+            
+            /* Update compression function if level changed */
+            compressFunc_t const adaptiveCompress = LZ4F_selectCompression(
+                cctxPtr->prefs.frameInfo.blockMode, currentLevel, blockCompression);
+            
+            /* Record compression time */
+            startTime = __rdtsc(); /* Use rdtsc for time measurement */
+            
+            /* Compress the block */
+            size_t compressedSize = LZ4F_makeBlock(dstPtr,
+                                     finalBlockData, finalBlockSize,
+                                     adaptiveCompress, cctxPtr->lz4CtxPtr, currentLevel,
+                                     cctxPtr->cdict,
+                                     cctxPtr->prefs.frameInfo.blockChecksumFlag,
+                                     cctxPtr->prefs.streamMode ? cctxPtr->frameId : 0,
+                                     cctxPtr->prefs.streamMode ? cctxPtr->blockId : 0);
+            
+            endTime = __rdtsc();
+            
+            dstPtr += compressedSize;
+            
+            /* Update compression history */
+            double compressionRatio = finalBlockSize / (double)compressedSize;
+            LZ4F_updateHistory(cctxPtr, currentLevel, entropy, repeatDensity, matchDensity, compressionRatio, endTime - startTime);
+        } else {
+            /* Regular compression */
+            dstPtr += LZ4F_makeBlock(dstPtr,
+                                     finalBlockData, finalBlockSize,
+                                     compress, cctxPtr->lz4CtxPtr, currentLevel,
+                                     cctxPtr->cdict,
+                                     cctxPtr->prefs.frameInfo.blockChecksumFlag,
+                                     cctxPtr->prefs.streamMode ? cctxPtr->frameId : 0,
+                                     cctxPtr->prefs.streamMode ? cctxPtr->blockId : 0);
+        }
+        
+        /* Update previous data for delta compression */
+        if (cctxPtr->prefs.deltaMode) {
+            if (cctxPtr->prevData != NULL) {
+                free(cctxPtr->prevData);
+            }
+            cctxPtr->prevData = malloc(blockSize);
+            if (cctxPtr->prevData != NULL) {
+                memcpy(cctxPtr->prevData, blockData, blockSize);
+                cctxPtr->prevDataSize = blockSize;
+            }
+        }
+        
+        /* Increment block ID for stream compression */
+        if (cctxPtr->prefs.streamMode) {
+            cctxPtr->blockId++;
+        }
+        
         srcPtr += blockSize;
     }
 
@@ -1078,7 +1354,9 @@ static size_t LZ4F_compressUpdateImpl(LZ4F_cctx* cctxPtr,
                                  srcPtr, (size_t)(srcEnd - srcPtr),
                                  compress, cctxPtr->lz4CtxPtr, cctxPtr->prefs.compressionLevel,
                                  cctxPtr->cdict,
-                                 cctxPtr->prefs.frameInfo.blockChecksumFlag);
+                                 cctxPtr->prefs.frameInfo.blockChecksumFlag,
+                                 cctxPtr->prefs.streamMode ? cctxPtr->frameId : 0,
+                                 cctxPtr->prefs.streamMode ? cctxPtr->blockId : 0);
         srcPtr = srcEnd;
     }
 
