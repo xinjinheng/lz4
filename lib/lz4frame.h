@@ -195,10 +195,14 @@ typedef struct {
   int      compressionLevel;    /* 0: default (fast mode); values > LZ4HC_CLEVEL_MAX count as LZ4HC_CLEVEL_MAX; values < 0 trigger "fast acceleration" */
   unsigned autoFlush;           /* 1: always flush; reduces usage of internal buffers */
   unsigned favorDecSpeed;       /* 1: parser favors decompression speed vs compression ratio. Only works for high compression modes (>= LZ4HC_CLEVEL_OPT_MIN) */  /* v1.8.2+ */
-  unsigned reserved[3];         /* must be zero for forward compatibility */
+  unsigned adaptiveMode;        /* 1: enable adaptive compression level selection */
+  unsigned deltaMode;           /* 1: enable delta compression for incremental data */
+  unsigned streamMode;          /* 1: enable low-latency real-time stream compression */
+  unsigned reserved[1];         /* must be zero for forward compatibility */
+  LZ4F_CustomMem customMem;
 } LZ4F_preferences_t;
 
-#define LZ4F_INIT_PREFERENCES   { LZ4F_INIT_FRAMEINFO, 0, 0u, 0u, { 0u, 0u, 0u } }    /* v1.8.3+ */
+#define LZ4F_INIT_PREFERENCES   { LZ4F_INIT_FRAMEINFO, 0, 0u, 0u, 0u, 0u, 0u, { 0u, 0u } }    /* v1.8.3+ */
 
 
 /*-*********************************
