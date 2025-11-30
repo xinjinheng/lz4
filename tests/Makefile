@@ -134,6 +134,9 @@ $(eval $(call c_program_shared_o,decompress-partial,lz4.o decompress-partial.o))
 decompress-partial-usingDict:
 $(eval $(call c_program_shared_o,decompress-partial-usingDict,lz4.o decompress-partial-usingDict.o))
 
+test-lz4chunked:
+$(eval $(call c_program_shared_o,test-lz4chunked,lz4.o lz4hc.o lz4frame.o xxhash.o lz4chunked.o test-lz4chunked.o))
+
 .PHONY: clean
 clean: clean_cache
 	@$(MAKE) -C $(LIBDIR) $@ > $(VOID)
