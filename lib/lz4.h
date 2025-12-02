@@ -142,6 +142,47 @@ extern "C" {
 LZ4LIB_API int LZ4_versionNumber (void);  /**< library version number; useful to check dll version; requires v1.3.0+ */
 LZ4LIB_API const char* LZ4_versionString (void);   /**< library version string; useful to check dll version; requires v1.7.5+ */
 
+/*------   Error Codes   ------*/
+typedef enum {
+    LZ4_STREAM_OK = 0,                 /**< No error */
+    LZ4_STREAM_ERR_MEMORY = -1,        /**< Memory allocation failed */
+    LZ4_STREAM_ERR_BUFFER_OVERFLOW = -2, /**< Buffer overflow detected */
+    LZ4_STREAM_ERR_INVALID_INPUT = -3,  /**< Invalid input parameter */
+    LZ4_STREAM_ERR_STATE_MISMATCH = -4, /**< Stream state mismatch */
+    LZ4_STREAM_ERR_INVALID_DICT = -5,   /**< Invalid dictionary */
+    LZ4_STREAM_ERR_CORRUPTED_DATA = -6  /**< Corrupted input data */
+} LZ4_streamErrorCode_t;
+
+/*------   Stream States   ------*/
+typedef enum {
+    LZ4_STREAM_STATE_UNINITIALIZED = 0, /**< Stream not initialized */
+    LZ4_STREAM_STATE_INITIALIZED = 1,   /**< Stream initialized and ready */
+    LZ4_STREAM_STATE_RUNNING = 2,       /**< Stream is processing data */
+    LZ4_STREAM_STATE_FINISHED = 3,      /**< Stream processing finished */
+    LZ4_STREAM_STATE_ERROR = 4          /**< Stream encountered an error */
+} LZ4_streamState_t;
+
+/**< Get the last error message for debugging purposes */
+LZ4LIB_API const char* LZ4_getLastError(void);
+
+/**< Get current state of a compression stream */
+LZ4LIB_API LZ4_streamState_t LZ4_streamGetState(const LZ4_stream_t* stream);
+
+/**< Get last error of a compression stream */
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_streamGetLastError(const LZ4_stream_t* stream);
+
+/**< Reset a compression stream to initial state */
+LZ4LIB_API void LZ4_streamReset(LZ4_stream_t* stream);
+
+/**< Get current state of a decompression stream */
+LZ4LIB_API LZ4_streamState_t LZ4_streamDecodeGetState(const LZ4_streamDecode_t* stream);
+
+/**< Get last error of a decompression stream */
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_streamDecodeGetLastError(const LZ4_streamDecode_t* stream);
+
+/**< Reset a decompression stream to initial state */
+LZ4LIB_API void LZ4_streamDecodeReset(LZ4_streamDecode_t* stream);
+
 
 /*-************************************
 *  Tuning memory usage
@@ -451,6 +492,15 @@ LZ4LIB_API int LZ4_compress_fast_continue (LZ4_stream_t* streamPtr, const char* 
  */
 LZ4LIB_API int LZ4_saveDict (LZ4_stream_t* streamPtr, char* safeBuffer, int maxDictSize);
 
+/**< Get current state of compression stream */
+LZ4LIB_API LZ4_streamState_t LZ4_streamGetState(const LZ4_stream_t* streamPtr);
+
+/**< Get last error of compression stream */
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_streamGetLastError(const LZ4_stream_t* streamPtr);
+
+/**< Reset compression stream state to initialized state, preserving dictionary */
+LZ4LIB_API int LZ4_streamReset(LZ4_stream_t* streamPtr);
+
 
 /*-**********************************************
 *  Streaming Decompression Functions
@@ -534,6 +584,15 @@ LZ4LIB_API int
 LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode,
                         const char* src, char* dst,
                         int srcSize, int dstCapacity);
+
+/**< Get current state of decompression stream */
+LZ4LIB_API LZ4_streamState_t LZ4_streamDecodeGetState(const LZ4_streamDecode_t* streamPtr);
+
+/**< Get last error of decompression stream */
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_streamDecodeGetLastError(const LZ4_streamDecode_t* streamPtr);
+
+/**< Reset decompression stream state to initialized state, preserving dictionary */
+LZ4LIB_API int LZ4_streamDecodeReset(LZ4_streamDecode_t* streamPtr);
 
 
 /*! LZ4_decompress_safe_usingDict() :
@@ -725,6 +784,8 @@ struct LZ4_stream_t_internal {
     LZ4_u32 currentOffset;
     LZ4_u32 tableType;
     LZ4_u32 dictSize;
+    LZ4_streamState_t streamState;     /**< Current stream state */
+    LZ4_streamErrorCode_t lastError;   /**< Last error encountered */
     /* Implicit padding to ensure structure is aligned */
 };
 
@@ -762,6 +823,8 @@ typedef struct {
     const LZ4_byte* prefixEnd;
     size_t extDictSize;
     size_t prefixSize;
+    LZ4_streamState_t streamState;     /**< Current stream state */
+    LZ4_streamErrorCode_t lastError;   /**< Last error encountered */
 } LZ4_streamDecode_t_internal;
 
 #define LZ4_STREAMDECODE_MINSIZE 32

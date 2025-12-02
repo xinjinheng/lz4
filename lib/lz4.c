@@ -290,6 +290,20 @@ static const int LZ4_minLength = (MFLIMIT+1);
 #  define DEBUGLOG(l, ...) {}    /* disabled */
 #endif
 
+/* Global error tracking */
+static LZ4_streamErrorCode_t g_lastGlobalError = LZ4_STREAM_OK;
+static const char* const g_errorMessages[] = {
+    "No error",
+    "Memory allocation failed",
+    "Buffer overflow detected",
+    "Invalid input parameter",
+    "Stream state mismatch",
+    "Invalid dictionary",
+    "Corrupted input data"
+};
+
+#define LZ4_SET_GLOBAL_ERROR(err) (g_lastGlobalError = (err))
+
 static int LZ4_isAligned(const void* ptr, size_t alignment)
 {
     return ((size_t)ptr & (alignment -1)) == 0;
@@ -1536,7 +1550,7 @@ LZ4_stream_t* LZ4_createStream(void)
     LZ4_stream_t* const lz4s = (LZ4_stream_t*)ALLOC(sizeof(LZ4_stream_t));
     LZ4_STATIC_ASSERT(sizeof(LZ4_stream_t) >= sizeof(LZ4_stream_t_internal));
     DEBUGLOG(4, "LZ4_createStream %p", (void*)lz4s);
-    if (lz4s == NULL) return NULL;
+    if (lz4s == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_MEMORY); return NULL; }
     LZ4_initStream(lz4s, sizeof(*lz4s));
     return lz4s;
 }
@@ -1554,11 +1568,15 @@ static size_t LZ4_stream_t_alignment(void)
 
 LZ4_stream_t* LZ4_initStream (void* buffer, size_t size)
 {
+    LZ4_stream_t_internal* internal;
     DEBUGLOG(5, "LZ4_initStream");
-    if (buffer == NULL) { return NULL; }
-    if (size < sizeof(LZ4_stream_t)) { return NULL; }
-    if (!LZ4_isAligned(buffer, LZ4_stream_t_alignment())) return NULL;
+    if (buffer == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return NULL; }
+    if (size < sizeof(LZ4_stream_t)) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return NULL; }
+    if (!LZ4_isAligned(buffer, LZ4_stream_t_alignment())) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return NULL; }
     MEM_INIT(buffer, 0, sizeof(LZ4_stream_t_internal));
+    internal = (LZ4_stream_t_internal*)buffer;
+    internal->streamState = LZ4_STREAM_INITIALIZED;
+    internal->lastError = LZ4_STREAM_OK;
     return (LZ4_stream_t*)buffer;
 }
 
@@ -1715,6 +1733,22 @@ int LZ4_compress_fast_continue (LZ4_stream_t* LZ4_stream,
     const tableType_t tableType = byU32;
     LZ4_stream_t_internal* const streamPtr = &LZ4_stream->internal_donotuse;
     const char* dictEnd = streamPtr->dictSize ? (const char*)streamPtr->dictionary + streamPtr->dictSize : NULL;
+
+    /* Parameter validation */
+    if (LZ4_stream == NULL || source == NULL || dest == NULL) {
+        LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT);
+        if (LZ4_stream) streamPtr->lastError = LZ4_STREAM_ERR_INVALID_INPUT;
+        return 0;
+    }
+    if (inputSize <= 0 || maxOutputSize <= 0) {
+        LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT);
+        streamPtr->lastError = LZ4_STREAM_ERR_INVALID_INPUT;
+        return 0;
+    }
+    
+    /* Update stream state */
+    streamPtr->streamState = LZ4_STREAM_RUNNING;
+    streamPtr->lastError = LZ4_STREAM_OK;
 
     DEBUGLOG(5, "LZ4_compress_fast_continue (inputSize=%i, dictSize=%u)", inputSize, streamPtr->dictSize);
 
@@ -2571,8 +2605,14 @@ int LZ4_decompress_safe_doubleDict(const char* source, char* dest, int compresse
 #if !defined(LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION)
 LZ4_streamDecode_t* LZ4_createStreamDecode(void)
 {
+    LZ4_streamDecode_t_internal* internal;
+    LZ4_streamDecode_t* const lz4ds = (LZ4_streamDecode_t*) ALLOC_AND_ZERO(sizeof(LZ4_streamDecode_t));
     LZ4_STATIC_ASSERT(sizeof(LZ4_streamDecode_t) >= sizeof(LZ4_streamDecode_t_internal));
-    return (LZ4_streamDecode_t*) ALLOC_AND_ZERO(sizeof(LZ4_streamDecode_t));
+    if (lz4ds == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_MEMORY); return NULL; }
+    internal = (LZ4_streamDecode_t_internal*)lz4ds;
+    internal->streamState = LZ4_STREAM_INITIALIZED;
+    internal->lastError = LZ4_STREAM_OK;
+    return lz4ds;
 }
 
 int LZ4_freeStreamDecode (LZ4_streamDecode_t* LZ4_stream)
@@ -2591,7 +2631,10 @@ int LZ4_freeStreamDecode (LZ4_streamDecode_t* LZ4_stream)
  */
 int LZ4_setStreamDecode (LZ4_streamDecode_t* LZ4_streamDecode, const char* dictionary, int dictSize)
 {
-    LZ4_streamDecode_t_internal* lz4sd = &LZ4_streamDecode->internal_donotuse;
+    LZ4_streamDecode_t_internal* lz4sd;
+    if (LZ4_streamDecode == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return 0; }
+    lz4sd = &LZ4_streamDecode->internal_donotuse;
+    lz4sd->lastError = LZ4_STREAM_OK;
     lz4sd->prefixSize = (size_t)dictSize;
     if (dictSize) {
         assert(dictionary != NULL);
@@ -2633,14 +2676,34 @@ int LZ4_decoderRingBufferSize(int maxBlockSize)
 LZ4_FORCE_O2
 int LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode, const char* source, char* dest, int compressedSize, int maxOutputSize)
 {
-    LZ4_streamDecode_t_internal* lz4sd = &LZ4_streamDecode->internal_donotuse;
+    LZ4_streamDecode_t_internal* lz4sd;
     int result;
+    
+    /* Parameter validation */
+    if (LZ4_streamDecode == NULL || source == NULL || dest == NULL) {
+        LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT);
+        return 0;
+    }
+    if (compressedSize <= 0 || maxOutputSize <= 0) {
+        LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT);
+        return 0;
+    }
+    
+    lz4sd = &LZ4_streamDecode->internal_donotuse;
+    /* Update stream state */
+    lz4sd->streamState = LZ4_STREAM_RUNNING;
+    lz4sd->lastError = LZ4_STREAM_OK;
 
     if (lz4sd->prefixSize == 0) {
         /* The first call, no dictionary yet. */
         assert(lz4sd->extDictSize == 0);
         result = LZ4_decompress_safe(source, dest, compressedSize, maxOutputSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->streamState = LZ4_STREAM_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_CORRUPTED_INPUT;
+            LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_CORRUPTED_INPUT);
+            return result;
+        }
         lz4sd->prefixSize = (size_t)result;
         lz4sd->prefixEnd = (BYTE*)dest + result;
     } else if (lz4sd->prefixEnd == (BYTE*)dest) {
@@ -2653,7 +2716,12 @@ int LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode, const ch
         else
             result = LZ4_decompress_safe_doubleDict(source, dest, compressedSize, maxOutputSize,
                                                     lz4sd->prefixSize, lz4sd->externalDict, lz4sd->extDictSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->streamState = LZ4_STREAM_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_CORRUPTED_INPUT;
+            LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_CORRUPTED_INPUT);
+            return result;
+        }
         lz4sd->prefixSize += (size_t)result;
         lz4sd->prefixEnd  += result;
     } else {
@@ -2662,7 +2730,12 @@ int LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode, const ch
         lz4sd->externalDict = lz4sd->prefixEnd - lz4sd->extDictSize;
         result = LZ4_decompress_safe_forceExtDict(source, dest, compressedSize, maxOutputSize,
                                                   lz4sd->externalDict, lz4sd->extDictSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->streamState = LZ4_STREAM_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_CORRUPTED_INPUT;
+            LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_CORRUPTED_INPUT);
+            return result;
+        }
         lz4sd->prefixSize = (size_t)result;
         lz4sd->prefixEnd  = (BYTE*)dest + result;
     }
@@ -2822,6 +2895,58 @@ void* LZ4_create (char* inputBuffer)
     return LZ4_createStream();
 }
 #endif
+
+/* Error handling and state management API implementation */
+
+LZ4LIB_API const char* LZ4_getLastError(void)
+{
+    if (g_lastGlobalError < 0 || g_lastGlobalError >= sizeof(g_errorMessages)/sizeof(g_errorMessages[0])) {
+        return "Unknown error";
+    }
+    return g_errorMessages[g_lastGlobalError];
+}
+
+LZ4LIB_API LZ4_streamState_t LZ4_streamGetState(const LZ4_stream_t* streamPtr)
+{
+    if (streamPtr == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return LZ4_STREAM_ERROR; }
+    return streamPtr->internal_donotuse.streamState;
+}
+
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_streamGetLastError(const LZ4_stream_t* streamPtr)
+{
+    if (streamPtr == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return LZ4_STREAM_ERR_INVALID_INPUT; }
+    return streamPtr->internal_donotuse.lastError;
+}
+
+LZ4LIB_API int LZ4_streamReset(LZ4_stream_t* streamPtr)
+{
+    if (streamPtr == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return 0; }
+    LZ4_resetStream_fast(streamPtr);
+    streamPtr->internal_donotuse.streamState = LZ4_STREAM_INITIALIZED;
+    streamPtr->internal_donotuse.lastError = LZ4_STREAM_OK;
+    return 1;
+}
+
+LZ4LIB_API LZ4_streamState_t LZ4_streamDecodeGetState(const LZ4_streamDecode_t* streamPtr)
+{
+    if (streamPtr == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return LZ4_STREAM_ERROR; }
+    return streamPtr->internal_donotuse.streamState;
+}
+
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_streamDecodeGetLastError(const LZ4_streamDecode_t* streamPtr)
+{
+    if (streamPtr == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return LZ4_STREAM_ERR_INVALID_INPUT; }
+    return streamPtr->internal_donotuse.lastError;
+}
+
+LZ4LIB_API int LZ4_streamDecodeReset(LZ4_streamDecode_t* streamPtr)
+{
+    if (streamPtr == NULL) { LZ4_SET_GLOBAL_ERROR(LZ4_STREAM_ERR_INVALID_INPUT); return 0; }
+    MEM_INIT(streamPtr, 0, sizeof(LZ4_streamDecode_t_internal));
+    streamPtr->internal_donotuse.streamState = LZ4_STREAM_INITIALIZED;
+    streamPtr->internal_donotuse.lastError = LZ4_STREAM_OK;
+    return 1;
+}
 
 char* LZ4_slideInputBuffer (void* state)
 {
