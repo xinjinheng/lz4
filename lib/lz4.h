@@ -42,6 +42,29 @@ extern "C" {
 /* --- Dependency --- */
 #include <stddef.h>   /* size_t */
 
+/* --- Error Codes --- */
+typedef enum {
+    LZ4_STREAM_OK = 0,
+    LZ4_STREAM_ERR_MEMORY,
+    LZ4_STREAM_ERR_BUFFER_OVERFLOW,
+    LZ4_STREAM_ERR_INVALID_INPUT,
+    LZ4_STREAM_ERR_STATE_MISMATCH,
+    LZ4_STREAM_ERR_UNKNOWN
+} LZ4_streamErrorCode_t;
+
+/* --- Stream State --- */
+typedef enum {
+    LZ4_STREAM_STATE_UNINITIALIZED,
+    LZ4_STREAM_STATE_INITIALIZED,
+    LZ4_STREAM_STATE_PROCESSING,
+    LZ4_STREAM_STATE_FINISHED,
+    LZ4_STREAM_STATE_ERROR
+} LZ4_streamState_t;
+
+/* --- Error Information --- */
+LZ4LIB_API const char* LZ4_getLastError(void);
+LZ4LIB_API LZ4_streamErrorCode_t LZ4_getLastErrorCode(void);
+
 
 /**
   Introduction
@@ -332,6 +355,8 @@ typedef union LZ4_stream_u LZ4_stream_t;  /* incomplete type (defined later) */
 #if !defined(LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION)
 LZ4LIB_API LZ4_stream_t* LZ4_createStream(void);
 LZ4LIB_API int           LZ4_freeStream (LZ4_stream_t* streamPtr);
+LZ4LIB_API LZ4_streamState_t LZ4_streamGetState (LZ4_stream_t* streamPtr);
+LZ4LIB_API int           LZ4_streamReset (LZ4_stream_t* streamPtr);
 #endif /* !defined(LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION) */
 #endif
 
@@ -466,6 +491,8 @@ typedef union LZ4_streamDecode_u LZ4_streamDecode_t;   /* tracking context */
 #if !defined(LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION)
 LZ4LIB_API LZ4_streamDecode_t* LZ4_createStreamDecode(void);
 LZ4LIB_API int                 LZ4_freeStreamDecode (LZ4_streamDecode_t* LZ4_stream);
+LZ4LIB_API LZ4_streamState_t  LZ4_streamDecodeGetState (LZ4_streamDecode_t* streamPtr);
+LZ4LIB_API int                 LZ4_streamDecodeReset (LZ4_streamDecode_t* streamPtr);
 #endif /* !defined(LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION) */
 #endif
 
@@ -726,6 +753,11 @@ struct LZ4_stream_t_internal {
     LZ4_u32 tableType;
     LZ4_u32 dictSize;
     /* Implicit padding to ensure structure is aligned */
+    
+    /* --- New fields for error and state management --- */
+    LZ4_streamState_t streamState;
+    LZ4_streamErrorCode_t lastErrorCode;
+    char lastErrorMsg[256];
 };
 
 #define LZ4_STREAM_MINSIZE  ((1UL << (LZ4_MEMORY_USAGE)) + 32)  /* static size, for inter-version compatibility */
@@ -762,6 +794,11 @@ typedef struct {
     const LZ4_byte* prefixEnd;
     size_t extDictSize;
     size_t prefixSize;
+    
+    /* --- New fields for error and state management --- */
+    LZ4_streamState_t streamState;
+    LZ4_streamErrorCode_t lastErrorCode;
+    char lastErrorMsg[256];
 } LZ4_streamDecode_t_internal;
 
 #define LZ4_STREAMDECODE_MINSIZE 32
