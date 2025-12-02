@@ -313,6 +313,49 @@ LZ4LIB_API int LZ4_decompress_safe_partial (const char* src, char* dst, int srcS
 /*-*********************************************
 *  Streaming Compression Functions
 ***********************************************/
+/*-*********************************************
+*  Stream Error Handling and Status Management
+***********************************************/
+/*! LZ4_stream_error_e :
+ *  Error codes for stream operations
+ *  These error codes are returned by enhanced stream functions
+ *  and can be retrieved using LZ4_getLastError()
+ */
+typedef enum {
+    LZ4_STREAM_OK = 0,                   /*!< No error, operation successful */
+    LZ4_STREAM_ERR_MEMORY = -1,          /*!< Memory allocation failed */
+    LZ4_STREAM_ERR_BUFFER_OVERFLOW = -2, /*!< Buffer overflow detected */
+    LZ4_STREAM_ERR_INVALID_INPUT = -3,   /*!< Invalid input data or parameters */
+    LZ4_STREAM_ERR_STATE_MISMATCH = -4,  /*!< Stream state mismatch (e.g., reset required) */
+    LZ4_STREAM_ERR_NULL_PARAM = -5,      /*!< Null parameter provided */
+    LZ4_STREAM_ERR_INVALID_SIZE = -6,    /*!< Invalid size parameter */
+    LZ4_STREAM_ERR_CORRUPT_DATA = -7,    /*!< Corrupt or invalid compressed data */
+    LZ4_STREAM_ERR_DICTIONARY = -8,      /*!< Dictionary related error */
+    LZ4_STREAM_ERR_ALIGNMENT = -9,       /*!< Memory alignment error */
+    LZ4_STREAM_ERR_UNSUPPORTED = -10     /*!< Unsupported operation or feature */
+} LZ4_stream_error_e;
+
+/*! LZ4_stream_state_e :
+ *  Stream states
+ *  These states are maintained within LZ4_stream_t and LZ4_streamDecode_t
+ *  and can be retrieved using LZ4_streamGetState() or LZ4_streamDecodeGetState()
+ */
+typedef enum {
+    LZ4_STREAM_STATE_UNINITIALIZED = 0,  /*!< Stream is uninitialized */
+    LZ4_STREAM_STATE_READY = 1,           /*!< Stream is ready for operation */
+    LZ4_STREAM_STATE_PROCESSING = 2,      /*!< Stream is actively processing data */
+    LZ4_STREAM_STATE_FINISHED = 3,        /*!< Stream has finished processing successfully */
+    LZ4_STREAM_STATE_ERROR = 4            /*!< Stream is in error state */
+} LZ4_stream_state_e;
+
+/*! LZ4_getLastError() :
+ *  Retrieves the last error message as a string
+ *  This function is thread-safe and returns a pointer to a static string
+ *  that describes the last error that occurred in the calling thread
+ *  @return : Pointer to a null-terminated string describing the last error
+ */
+LZ4LIB_API const char* LZ4_getLastError(void);
+
 typedef union LZ4_stream_u LZ4_stream_t;  /* incomplete type (defined later) */
 
 /*!
@@ -725,10 +768,12 @@ struct LZ4_stream_t_internal {
     LZ4_u32 currentOffset;
     LZ4_u32 tableType;
     LZ4_u32 dictSize;
+    LZ4_stream_state_e state;  /*!< Current stream state */
+    LZ4_stream_error_e lastError;  /*!< Last error occurred in this stream */
     /* Implicit padding to ensure structure is aligned */
 };
 
-#define LZ4_STREAM_MINSIZE  ((1UL << (LZ4_MEMORY_USAGE)) + 32)  /* static size, for inter-version compatibility */
+#define LZ4_STREAM_MINSIZE  ((1UL << (LZ4_MEMORY_USAGE)) + 32 + 8)  /* static size, for inter-version compatibility (extra 8 bytes for state and lastError fields) */
 union LZ4_stream_u {
     char minStateSize[LZ4_STREAM_MINSIZE];
     LZ4_stream_t_internal internal_donotuse;
@@ -762,9 +807,11 @@ typedef struct {
     const LZ4_byte* prefixEnd;
     size_t extDictSize;
     size_t prefixSize;
+    LZ4_stream_state_e state;  /*!< Current stream state */
+    LZ4_stream_error_e lastError;  /*!< Last error occurred in this stream */
 } LZ4_streamDecode_t_internal;
 
-#define LZ4_STREAMDECODE_MINSIZE 32
+#define LZ4_STREAMDECODE_MINSIZE (32 + 8)  /* +8 bytes for state and lastError fields */
 union LZ4_streamDecode_u {
     char minStateSize[LZ4_STREAMDECODE_MINSIZE];
     LZ4_streamDecode_t_internal internal_donotuse;
@@ -865,6 +912,20 @@ LZ4_DEPRECATED("This function is deprecated and unsafe. Consider using LZ4_decom
 LZ4LIB_API int LZ4_decompress_fast (const char* src, char* dst, int originalSize);
 LZ4_DEPRECATED("This function is deprecated and unsafe. Consider migrating towards LZ4_decompress_safe_continue() instead. "
                "Note that the contract will change (requires block's compressed size, instead of decompressed size)")
+/*! LZ4_streamDecodeGetState() :
+ *  Retrieves the current state of a decompression stream
+ *  @LZ4_streamDecode : pointer to an initialized decompression stream
+ *  @return : Current state of the stream as LZ4_stream_state_e enum
+ */
+LZ4LIB_API LZ4_stream_state_e LZ4_streamDecodeGetState(const LZ4_streamDecode_t* LZ4_streamDecode);
+
+/*! LZ4_streamDecodeReset() :
+ *  Resets a decompression stream to its initial ready state
+ *  This function clears any error state and resets the stream for new operations
+ *  @LZ4_streamDecode : pointer to an initialized decompression stream
+ */
+LZ4LIB_API void LZ4_streamDecodeReset(LZ4_streamDecode_t* LZ4_streamDecode);
+
 LZ4LIB_API int LZ4_decompress_fast_continue (LZ4_streamDecode_t* LZ4_streamDecode, const char* src, char* dst, int originalSize);
 LZ4_DEPRECATED("This function is deprecated and unsafe. Consider using LZ4_decompress_safe_partial_usingDict() instead")
 LZ4LIB_API int LZ4_decompress_fast_usingDict (const char* src, char* dst, int originalSize, const char* dictStart, int dictSize);
@@ -875,6 +936,20 @@ LZ4LIB_API int LZ4_decompress_fast_usingDict (const char* src, char* dst, int or
  *  Consider switching to LZ4_initStream(),
  *  invoking LZ4_resetStream() will trigger deprecation warnings in the future.
  */
+/*! LZ4_streamGetState() :
+ *  Retrieves the current state of a compression stream
+ *  @streamPtr : pointer to an initialized compression stream
+ *  @return : Current state of the stream as LZ4_stream_state_e enum
+ */
+LZ4LIB_API LZ4_stream_state_e LZ4_streamGetState(const LZ4_stream_t* streamPtr);
+
+/*! LZ4_streamReset() :
+ *  Resets a compression stream to its initial ready state
+ *  This function clears any error state and resets the stream for new operations
+ *  @streamPtr : pointer to an initialized compression stream
+ */
+LZ4LIB_API void LZ4_streamReset(LZ4_stream_t* streamPtr);
+
 LZ4LIB_API void LZ4_resetStream (LZ4_stream_t* streamPtr);
 
 

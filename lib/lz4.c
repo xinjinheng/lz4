@@ -118,6 +118,55 @@
 /* see also "memory routines" below */
 
 
+/*-*********************************************
+*  Stream Error Handling and Status Management
+***********************************************/
+/*
+ * Thread-local error storage for LZ4_getLastError()
+ * Each thread gets its own error storage to ensure thread safety
+ */
+#if defined(_WIN32)
+#  include <windows.h>
+#  define LZ4_TLS_TYPE DWORD
+#  define LZ4_TLS_VARNAME g_lastErrorTlsIndex
+#  define LZ4_TLS_INIT() TlsAlloc()
+#  define LZ4_TLS_DEINIT(index) TlsFree(index)
+#  define LZ4_TLS_SET(index, value) TlsSetValue(index, (LPVOID)(value))
+#  define LZ4_TLS_GET(index) (LZ4_stream_error_e)(TlsGetValue(index))
+#elif defined(_POSIX_THREADS)
+#  include <pthread.h>
+#  define LZ4_TLS_TYPE pthread_key_t
+#  define LZ4_TLS_VARNAME g_lastErrorTlsKey
+#  define LZ4_TLS_INIT() pthread_key_create(&g_lastErrorTlsKey, NULL)
+#  define LZ4_TLS_DEINIT(key) pthread_key_delete(key)
+#  define LZ4_TLS_SET(key, value) pthread_setspecific(key, (void*)(value))
+#  define LZ4_TLS_GET(key) (LZ4_stream_error_e)(pthread_getspecific(key))
+#else
+/* Fallback to global variable for non-threaded environments */
+#  define LZ4_TLS_TYPE LZ4_stream_error_e
+#  define LZ4_TLS_VARNAME g_lastErrorGlobal
+#  define LZ4_TLS_INIT() (g_lastErrorGlobal = LZ4_STREAM_OK)
+#  define LZ4_TLS_DEINIT(var) ((void)0)
+#  define LZ4_TLS_SET(var, value) (var = (value))
+#  define LZ4_TLS_GET(var) (var)
+#endif
+
+static LZ4_TLS_TYPE LZ4_TLS_VARNAME;
+
+/*!
+ * LZ4_setLastError() :
+ * Internal function to set the last error in thread-local storage
+ */
+static void LZ4_setLastError(LZ4_stream_error_e error) {
+    static int initialized = 0;
+    if (!initialized) {
+        LZ4_TLS_INIT();
+        initialized = 1;
+    }
+    LZ4_TLS_SET(LZ4_TLS_VARNAME, error);
+}
+
+
 /*-************************************
 *  Compiler Options
 **************************************/
@@ -1536,8 +1585,13 @@ LZ4_stream_t* LZ4_createStream(void)
     LZ4_stream_t* const lz4s = (LZ4_stream_t*)ALLOC(sizeof(LZ4_stream_t));
     LZ4_STATIC_ASSERT(sizeof(LZ4_stream_t) >= sizeof(LZ4_stream_t_internal));
     DEBUGLOG(4, "LZ4_createStream %p", (void*)lz4s);
-    if (lz4s == NULL) return NULL;
+    if (lz4s == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_MEMORY);
+        return NULL;
+    }
     LZ4_initStream(lz4s, sizeof(*lz4s));
+    lz4s->internal_donotuse.state = LZ4_STREAM_STATE_READY;
+    lz4s->internal_donotuse.lastError = LZ4_STREAM_OK;
     return lz4s;
 }
 #endif
@@ -1555,10 +1609,21 @@ static size_t LZ4_stream_t_alignment(void)
 LZ4_stream_t* LZ4_initStream (void* buffer, size_t size)
 {
     DEBUGLOG(5, "LZ4_initStream");
-    if (buffer == NULL) { return NULL; }
-    if (size < sizeof(LZ4_stream_t)) { return NULL; }
-    if (!LZ4_isAligned(buffer, LZ4_stream_t_alignment())) return NULL;
+    if (buffer == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        return NULL;
+    }
+    if (size < sizeof(LZ4_stream_t)) {
+        LZ4_setLastError(LZ4_STREAM_ERR_BUFFER_SIZE);
+        return NULL;
+    }
+    if (!LZ4_isAligned(buffer, LZ4_stream_t_alignment())) {
+        LZ4_setLastError(LZ4_STREAM_ERR_ALIGNMENT);
+        return NULL;
+    }
     MEM_INIT(buffer, 0, sizeof(LZ4_stream_t_internal));
+    ((LZ4_stream_t*)buffer)->internal_donotuse.state = LZ4_STREAM_STATE_READY;
+    ((LZ4_stream_t*)buffer)->internal_donotuse.lastError = LZ4_STREAM_OK;
     return (LZ4_stream_t*)buffer;
 }
 
@@ -1568,6 +1633,8 @@ void LZ4_resetStream (LZ4_stream_t* LZ4_stream)
 {
     DEBUGLOG(5, "LZ4_resetStream (ctx:%p)", (void*)LZ4_stream);
     MEM_INIT(LZ4_stream, 0, sizeof(LZ4_stream_t_internal));
+    LZ4_stream->internal_donotuse.state = LZ4_STREAM_STATE_READY;
+    LZ4_stream->internal_donotuse.lastError = LZ4_STREAM_OK;
 }
 
 void LZ4_resetStream_fast(LZ4_stream_t* ctx) {
@@ -1718,6 +1785,32 @@ int LZ4_compress_fast_continue (LZ4_stream_t* LZ4_stream,
 
     DEBUGLOG(5, "LZ4_compress_fast_continue (inputSize=%i, dictSize=%u)", inputSize, streamPtr->dictSize);
 
+    /* Error checking */
+    if (LZ4_stream == NULL || source == NULL || dest == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        if (LZ4_stream != NULL) {
+            streamPtr->state = LZ4_STREAM_STATE_ERROR;
+            streamPtr->lastError = LZ4_STREAM_ERR_INVALID_ARG;
+        }
+        return 0;
+    }
+    if (inputSize <= 0) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        streamPtr->state = LZ4_STREAM_STATE_ERROR;
+        streamPtr->lastError = LZ4_STREAM_ERR_INVALID_ARG;
+        return 0;
+    }
+    if (maxOutputSize < LZ4_compressBound(inputSize)) {
+        LZ4_setLastError(LZ4_STREAM_ERR_OUTPUT_BUFFER);
+        streamPtr->state = LZ4_STREAM_STATE_ERROR;
+        streamPtr->lastError = LZ4_STREAM_ERR_OUTPUT_BUFFER;
+        return 0;
+    }
+
+    /* Update stream state */
+    streamPtr->state = LZ4_STREAM_STATE_COMPRESSING;
+    streamPtr->lastError = LZ4_STREAM_OK;
+
     LZ4_renormDictT(streamPtr, inputSize);   /* fix index overflow */
     if (acceleration < 1) acceleration = LZ4_ACCELERATION_DEFAULT;
     if (acceleration > LZ4_ACCELERATION_MAX) acceleration = LZ4_ACCELERATION_MAX;
@@ -1747,10 +1840,21 @@ int LZ4_compress_fast_continue (LZ4_stream_t* LZ4_stream,
 
     /* prefix mode : source data follows dictionary */
     if (dictEnd == source) {
+        int result;
         if ((streamPtr->dictSize < 64 KB) && (streamPtr->dictSize < streamPtr->currentOffset))
-            return LZ4_compress_generic(streamPtr, source, dest, inputSize, NULL, maxOutputSize, limitedOutput, tableType, withPrefix64k, dictSmall, acceleration);
+            result = LZ4_compress_generic(streamPtr, source, dest, inputSize, NULL, maxOutputSize, limitedOutput, tableType, withPrefix64k, dictSmall, acceleration);
         else
-            return LZ4_compress_generic(streamPtr, source, dest, inputSize, NULL, maxOutputSize, limitedOutput, tableType, withPrefix64k, noDictIssue, acceleration);
+            result = LZ4_compress_generic(streamPtr, source, dest, inputSize, NULL, maxOutputSize, limitedOutput, tableType, withPrefix64k, noDictIssue, acceleration);
+        /* Update stream state */
+        if (result > 0) {
+            streamPtr->state = LZ4_STREAM_STATE_READY;
+            streamPtr->lastError = LZ4_STREAM_OK;
+        } else {
+            streamPtr->state = LZ4_STREAM_STATE_ERROR;
+            streamPtr->lastError = LZ4_STREAM_ERR_COMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_COMPRESSION);
+        }
+        return result;
     }
 
     /* external dictionary mode */
@@ -1778,6 +1882,15 @@ int LZ4_compress_fast_continue (LZ4_stream_t* LZ4_stream,
             } else {
                 result = LZ4_compress_generic(streamPtr, source, dest, inputSize, NULL, maxOutputSize, limitedOutput, tableType, usingExtDict, noDictIssue, acceleration);
             }
+        }
+        /* Update stream state */
+        if (result > 0) {
+            streamPtr->state = LZ4_STREAM_STATE_READY;
+            streamPtr->lastError = LZ4_STREAM_OK;
+        } else {
+            streamPtr->state = LZ4_STREAM_STATE_ERROR;
+            streamPtr->lastError = LZ4_STREAM_ERR_COMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_COMPRESSION);
         }
         streamPtr->dictionary = (const BYTE*)source;
         streamPtr->dictSize = (U32)inputSize;
@@ -2571,8 +2684,15 @@ int LZ4_decompress_safe_doubleDict(const char* source, char* dest, int compresse
 #if !defined(LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION)
 LZ4_streamDecode_t* LZ4_createStreamDecode(void)
 {
+    LZ4_streamDecode_t* const lz4sd = (LZ4_streamDecode_t*) ALLOC_AND_ZERO(sizeof(LZ4_streamDecode_t));
     LZ4_STATIC_ASSERT(sizeof(LZ4_streamDecode_t) >= sizeof(LZ4_streamDecode_t_internal));
-    return (LZ4_streamDecode_t*) ALLOC_AND_ZERO(sizeof(LZ4_streamDecode_t));
+    if (lz4sd == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_MEMORY);
+        return NULL;
+    }
+    lz4sd->internal_donotuse.state = LZ4_STREAM_STATE_READY;
+    lz4sd->internal_donotuse.lastError = LZ4_STREAM_OK;
+    return lz4sd;
 }
 
 int LZ4_freeStreamDecode (LZ4_streamDecode_t* LZ4_stream)
@@ -2636,11 +2756,36 @@ int LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode, const ch
     LZ4_streamDecode_t_internal* lz4sd = &LZ4_streamDecode->internal_donotuse;
     int result;
 
+    /* Error checking */
+    if (LZ4_streamDecode == NULL || source == NULL || dest == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        if (LZ4_streamDecode != NULL) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_INVALID_ARG;
+        }
+        return 0;
+    }
+    if (compressedSize <= 0 || maxOutputSize <= 0) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        lz4sd->state = LZ4_STREAM_STATE_ERROR;
+        lz4sd->lastError = LZ4_STREAM_ERR_INVALID_ARG;
+        return 0;
+    }
+
+    /* Update stream state */
+    lz4sd->state = LZ4_STREAM_STATE_DECOMPRESSING;
+    lz4sd->lastError = LZ4_STREAM_OK;
+
     if (lz4sd->prefixSize == 0) {
         /* The first call, no dictionary yet. */
         assert(lz4sd->extDictSize == 0);
         result = LZ4_decompress_safe(source, dest, compressedSize, maxOutputSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_DECOMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_DECOMPRESSION);
+            return result;
+        }
         lz4sd->prefixSize = (size_t)result;
         lz4sd->prefixEnd = (BYTE*)dest + result;
     } else if (lz4sd->prefixEnd == (BYTE*)dest) {
@@ -2653,7 +2798,12 @@ int LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode, const ch
         else
             result = LZ4_decompress_safe_doubleDict(source, dest, compressedSize, maxOutputSize,
                                                     lz4sd->prefixSize, lz4sd->externalDict, lz4sd->extDictSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_DECOMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_DECOMPRESSION);
+            return result;
+        }
         lz4sd->prefixSize += (size_t)result;
         lz4sd->prefixEnd  += result;
     } else {
@@ -2662,10 +2812,19 @@ int LZ4_decompress_safe_continue (LZ4_streamDecode_t* LZ4_streamDecode, const ch
         lz4sd->externalDict = lz4sd->prefixEnd - lz4sd->extDictSize;
         result = LZ4_decompress_safe_forceExtDict(source, dest, compressedSize, maxOutputSize,
                                                   lz4sd->externalDict, lz4sd->extDictSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_DECOMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_DECOMPRESSION);
+            return result;
+        }
         lz4sd->prefixSize = (size_t)result;
         lz4sd->prefixEnd  = (BYTE*)dest + result;
     }
+
+    /* Update stream state */
+    lz4sd->state = LZ4_STREAM_STATE_READY;
+    lz4sd->lastError = LZ4_STREAM_OK;
 
     return result;
 }
@@ -2685,7 +2844,12 @@ LZ4_decompress_fast_continue (LZ4_streamDecode_t* LZ4_streamDecode,
         DEBUGLOG(5, "first invocation : no prefix nor extDict");
         assert(lz4sd->extDictSize == 0);
         result = LZ4_decompress_fast(source, dest, originalSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_DECOMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_DECOMPRESSION);
+            return result;
+        }
         lz4sd->prefixSize = (size_t)originalSize;
         lz4sd->prefixEnd = (BYTE*)dest + originalSize;
     } else if (lz4sd->prefixEnd == (BYTE*)dest) {
@@ -2694,7 +2858,12 @@ LZ4_decompress_fast_continue (LZ4_streamDecode_t* LZ4_streamDecode,
                         (const BYTE*)source, (BYTE*)dest, originalSize,
                         lz4sd->prefixSize,
                         lz4sd->externalDict, lz4sd->extDictSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_DECOMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_DECOMPRESSION);
+            return result;
+        }
         lz4sd->prefixSize += (size_t)originalSize;
         lz4sd->prefixEnd  += originalSize;
     } else {
@@ -2703,10 +2872,19 @@ LZ4_decompress_fast_continue (LZ4_streamDecode_t* LZ4_streamDecode,
         lz4sd->externalDict = lz4sd->prefixEnd - lz4sd->extDictSize;
         result = LZ4_decompress_fast_extDict(source, dest, originalSize,
                                              lz4sd->externalDict, lz4sd->extDictSize);
-        if (result <= 0) return result;
+        if (result <= 0) {
+            lz4sd->state = LZ4_STREAM_STATE_ERROR;
+            lz4sd->lastError = LZ4_STREAM_ERR_DECOMPRESSION;
+            LZ4_setLastError(LZ4_STREAM_ERR_DECOMPRESSION);
+            return result;
+        }
         lz4sd->prefixSize = (size_t)originalSize;
         lz4sd->prefixEnd  = (BYTE*)dest + originalSize;
     }
+
+    /* Update stream state */
+    lz4sd->state = LZ4_STREAM_STATE_READY;
+    lz4sd->lastError = LZ4_STREAM_OK;
 
     return result;
 }
@@ -2827,6 +3005,84 @@ char* LZ4_slideInputBuffer (void* state)
 {
     /* avoid const char * -> char * conversion warning */
     return (char *)(uptrval)((LZ4_stream_t*)state)->internal_donotuse.dictionary;
+}
+
+
+/*=*************************************************
+*  Stream Error Handling and Status Management Functions
+***************************************************/
+
+/*! LZ4_getLastError() :
+ *  Retrieves the last error that occurred in any LZ4 stream operation
+ *  This function is thread-safe
+ *  @return : The last error code as LZ4_stream_error_e enum
+ */
+LZ4LIB_API LZ4_stream_error_e LZ4_getLastError(void) {
+    static int initialized = 0;
+    if (!initialized) {
+        LZ4_TLS_INIT();
+        initialized = 1;
+    }
+    return LZ4_TLS_GET(LZ4_TLS_VARNAME);
+}
+
+/*! LZ4_streamGetState() :
+ *  Retrieves the current state of a compression stream
+ *  @LZ4_stream : pointer to an initialized compression stream
+ *  @return : Current state of the stream as LZ4_stream_state_e enum
+ */
+LZ4LIB_API LZ4_stream_state_e LZ4_streamGetState(const LZ4_stream_t* LZ4_stream) {
+    if (LZ4_stream == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        return LZ4_STREAM_STATE_INVALID;
+    }
+    return LZ4_stream->internal_donotuse.state;
+}
+
+/*! LZ4_streamReset() :
+ *  Resets a compression stream to its initial ready state
+ *  This function clears any error state and resets the stream for new operations
+ *  @LZ4_stream : pointer to an initialized compression stream
+ */
+LZ4LIB_API void LZ4_streamReset(LZ4_stream_t* LZ4_stream) {
+    if (LZ4_stream == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        return;
+    }
+    LZ4_resetStream(LZ4_stream);
+    LZ4_stream->internal_donotuse.lastError = LZ4_STREAM_OK;
+}
+
+/*! LZ4_streamDecodeGetState() :
+ *  Retrieves the current state of a decompression stream
+ *  @LZ4_streamDecode : pointer to an initialized decompression stream
+ *  @return : Current state of the stream as LZ4_stream_state_e enum
+ */
+LZ4LIB_API LZ4_stream_state_e LZ4_streamDecodeGetState(const LZ4_streamDecode_t* LZ4_streamDecode) {
+    if (LZ4_streamDecode == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        return LZ4_STREAM_STATE_INVALID;
+    }
+    return LZ4_streamDecode->internal_donotuse.state;
+}
+
+/*! LZ4_streamDecodeReset() :
+ *  Resets a decompression stream to its initial ready state
+ *  This function clears any error state and resets the stream for new operations
+ *  @LZ4_streamDecode : pointer to an initialized decompression stream
+ */
+LZ4LIB_API void LZ4_streamDecodeReset(LZ4_streamDecode_t* LZ4_streamDecode) {
+    if (LZ4_streamDecode == NULL) {
+        LZ4_setLastError(LZ4_STREAM_ERR_INVALID_ARG);
+        return;
+    }
+    LZ4_streamDecode->internal_donotuse.state = LZ4_STREAM_STATE_READY;
+    LZ4_streamDecode->internal_donotuse.lastError = LZ4_STREAM_OK;
+    /* Reset dictionary state */
+    LZ4_streamDecode->internal_donotuse.externalDict = NULL;
+    LZ4_streamDecode->internal_donotuse.prefixEnd = NULL;
+    LZ4_streamDecode->internal_donotuse.extDictSize = 0;
+    LZ4_streamDecode->internal_donotuse.prefixSize = 0;
 }
 
 #endif   /* LZ4_COMMONDEFS_ONLY */
